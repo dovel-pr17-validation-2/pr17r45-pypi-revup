@@ -1,0 +1,415 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import logging
+import os
+import stat
+import subprocess
+import sys
+from typing import Any
+
+from revup import config, git, logs, shell
+from revup.completion import (
+    ShellType,
+    install_completion,
+    make_config_flag_completer,
+    maybe_prompt_user_for_completions,
+    topic_completer,
+)
+from revup.config import RevupArgParser
+from revup.core_types import RevupUsageException
+from revup.forge_utils import parse_forge_info
+from revup.topic_stack import PrBodySource, TrimTags
+from revup.version import REVUP_VERSION
+
+REVUP_CONFIG_ENV_VAR = "REVUP_CONFIG_PATH"
+CONFIG_FILE_NAME = ".revupconfig"
+
+
+class HelpAction(argparse.Action):
+    """
+    A help action that displays a manpage formatted from the markdown documentation if available.
+    """
+
+    def __call__(self, parser: Any, namespace: Any, values: Any, option_string: Any = None) -> None:
+        source_dir = os.path.dirname(os.path.abspath(__file__))
+        man_cmd = ("man", "-M", source_dir, parser.prog.split()[-1])
+        try:
+            if subprocess.call(man_cmd) != 0:
+                print("Error in showing man page")
+                print(parser.format_help())
+        except FileNotFoundError:
+            print("'man' binary not found.")
+            print(parser.format_help())
+        sys.exit(0)
+
+
+def make_toplevel_parser() -> RevupArgParser:
+    revup_parser = RevupArgParser(add_help=False, prog="revup")
+    revup_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
+    revup_parser.add_argument("--version", action="version", version=f"%(prog)s {REVUP_VERSION}")
+    revup_parser.add_argument("--proxy")
+    revup_parser.add_argument("--forge-oauth", "--github-oauth")
+    revup_parser.add_argument("--forge-url", "--github-url", default="github.com")
+    revup_parser.add_argument("--remote-name", default="origin")
+    revup_parser.add_argument("--fork-name", default="")
+    revup_parser.add_argument("--editor")
+    revup_parser.add_argument("--verbose", "-v", action="store_true")
+    revup_parser.add_argument("--log-to-file", action="store_true")
+    revup_parser.add_argument("--keep-temp", "-k", action="store_true")
+    revup_parser.add_argument("--git-path", default="")
+    revup_parser.add_argument("--main-branch", default="main")
+    revup_parser.add_argument("--base-branch-globs", default="")
+    revup_parser.add_argument("--git-version", default="2.45.0")
+    for s in ShellType:
+        revup_parser.add_argument(
+            f"--prompt-completion-{s.value}", default="", help=argparse.SUPPRESS
+        )
+    return revup_parser
+
+
+def get_config_path() -> str:
+    home_path = os.path.expanduser("~")
+    return os.environ.get(
+        os.path.expanduser(REVUP_CONFIG_ENV_VAR),
+        os.path.join(home_path, CONFIG_FILE_NAME),
+    )
+
+
+async def get_config() -> config.Config:
+    config_path = get_config_path()
+    if os.path.isfile(config_path) and hasattr(os, "getuid"):
+        config_stat = os.stat(config_path)
+        if config_stat.st_uid != os.getuid():
+            raise RevupUsageException("Config file is not owned by the current user!")
+        if stat.S_IMODE(config_stat.st_mode) != 0o600:
+            raise RevupUsageException(
+                f"Permissions too loose on config file!\nTry `chmod 0600 {config_path}`"
+            )
+
+    # There's a chicken/egg problem in getting git path from config when we need git
+    # to find the path of the config file. Just this once, we use the default.
+    sh = shell.Shell()
+    rev_parse_out = (
+        await sh.sh(
+            git.get_default_git(),
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        )
+    )[1].splitlines()
+    repo_root, git_dir = rev_parse_out[0].rstrip(), rev_parse_out[1].rstrip()
+    conf = config.Config(
+        config_path,
+        os.path.join(repo_root, CONFIG_FILE_NAME),
+        os.path.join(git_dir, CONFIG_FILE_NAME),
+    )
+    conf.read()
+    return conf
+
+
+def dump_args(args: argparse.Namespace) -> None:
+    if logging.getLogger().isEnabledFor(logging.DEBUG):
+        import json
+
+        logging.debug(json.dumps(vars(args), default=str, indent=2))
+
+
+def build_parser() -> tuple[RevupArgParser, list[RevupArgParser]]:
+    """Build the argument parser and all subparsers. Must be called before the event loop starts
+    so that argcomplete completers can use asyncio.run()."""
+    revup_parser = make_toplevel_parser()
+    subparsers = revup_parser.add_subparsers(dest="cmd", required=True, parser_class=RevupArgParser)
+
+    upload_parser = subparsers.add_parser("upload", add_help=False)
+    restack_parser = subparsers.add_parser(
+        "restack",
+        add_help=False,
+    )
+    cherry_pick_parser = subparsers.add_parser(
+        "cherry-pick",
+        add_help=False,
+    )
+    amend_parser = subparsers.add_parser("amend", aliases=["commit"], add_help=False)
+    optimize_stack_parser = subparsers.add_parser("optimize-stack", add_help=False)
+    config_parser = subparsers.add_parser(
+        "config",
+        add_help=False,
+    )
+    toolkit_parser = subparsers.add_parser(
+        "toolkit", description="Exercise various subfunctionalities."
+    )
+    install_completion_parser = subparsers.add_parser("install-completion")
+    install_completion_parser.add_argument(
+        "--shell", type=ShellType, choices=ShellType, required=True
+    )
+    install_completion_parser.add_argument("--rc-file")
+
+    # Intentionally does not contain config or toolkit parsers since the those are not configurable
+    all_parsers: list[RevupArgParser] = [
+        revup_parser,
+        amend_parser,
+        cherry_pick_parser,
+        restack_parser,
+        upload_parser,
+        optimize_stack_parser,
+    ]
+
+    for p in [upload_parser, restack_parser, amend_parser, optimize_stack_parser]:
+        # Args shared by the commands that operate on the stack
+        p.add_argument("--help", "-h", action=HelpAction, nargs=0)
+        p.add_argument("--base-branch", "-b")
+        p.add_argument("--relative-branch", "-e")
+
+    topics_arg = upload_parser.add_argument("topics", nargs="*")
+    topics_arg.completer = topic_completer  # type: ignore[attr-defined]
+    upload_parser.add_argument("--rebase", "-r", action="store_true")
+    upload_parser.add_argument("--skip-confirm", "-s", action="store_true")
+    upload_parser.add_argument("--dry-run", "-d", action="store_true")
+    upload_parser.add_argument("--push-only", action="store_true")
+    upload_parser.add_argument("--status", "-t", action="store_true")
+    upload_parser.add_argument("--update-pr-body", action="store_true", default=True)
+    upload_parser.add_argument("--create-local-branches", action="store_true")
+    upload_parser.add_argument("--review-graph", action="store_true", default=True)
+    upload_parser.add_argument(
+        "--trim-tags",
+        default=TrimTags.NONE.value,
+        choices=[t.value for t in TrimTags],
+    )
+    upload_parser.add_argument("--patchsets", action="store_true", default=True)
+    upload_parser.add_argument("--self-authored-only", action="store_true", default=True)
+    upload_parser.add_argument("--labels")
+    upload_parser.add_argument(
+        "--auto-add-users", default="no", choices=["no", "a2r", "r2a", "both"]
+    )
+    upload_parser.add_argument(
+        "--user-aliases",
+    )
+    upload_parser.add_argument("--uploader")
+    upload_parser.add_argument(
+        "--branch-format",
+        choices=["user+branch", "user", "branch", "none"],
+        default="user+branch",
+    )
+    upload_parser.add_argument("--pre-upload", "-p")
+    upload_parser.add_argument("--no-verify", action="store_true")
+    upload_parser.add_argument("--relative-chain", "-c", action="store_true")
+    upload_parser.add_argument("--auto-topic", "-a", action="store_true")
+    upload_parser.add_argument("--force-reviewers", action="store_true")
+    upload_parser.add_argument(
+        "--pr-body-source",
+        type=PrBodySource,
+        choices=PrBodySource,
+        default=PrBodySource.FIRST_COMMIT,
+    )
+    upload_parser.add_argument("--skip-empty-first-commit", action="store_true")
+    upload_parser.add_argument("--draft-on-create-only", action="store_true")
+    upload_parser.add_argument("--deep-stack-draft", type=int, default=0)
+    upload_parser.add_argument("--head", default="HEAD")
+
+    restack_parser.add_argument("--topicless-last", "-t", action="store_true")
+    restack_parser.add_argument("--squash", "-s", action="store_true")
+
+    ref_or_topic_arg = amend_parser.add_argument("ref_or_topic", nargs="?")
+    ref_or_topic_arg.completer = topic_completer  # type: ignore[attr-defined]
+    amend_parser.add_argument("--edit", "-s", default=True, action="store_true")
+    amend_parser.add_argument("--message", "-m")
+    amend_parser.add_argument("--insert", "-i", action="store_true")
+    amend_parser.add_argument("--drop", "-d", action="store_true")
+    amend_parser.add_argument("--last-touched", "-l", action="store_true")
+    amend_parser.add_argument("--all", "-a", action="store_true")
+
+    amend_parser.add_argument("--parse-topics", default=True, action="store_true")
+    amend_parser.add_argument("--parse-refs", default=True, action="store_true")
+
+    optimize_stack_parser.add_argument("--auto-topic", "-a", action="store_true")
+    optimize_stack_parser.add_argument("--ignore-existing", "-i", action="store_true")
+    optimize_stack_parser.add_argument("--write", "-w", action="store_true")
+    optimize_stack_parser.add_argument("--force-write", "-f", action="store_true")
+
+    cherry_pick_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
+    cherry_pick_parser.add_argument("branch_or_pr_url", nargs=1)
+    cherry_pick_parser.add_argument("--base-branch", "-b")
+
+    config_parser.add_argument("--help", "-h", action=HelpAction, nargs=0)
+    config_flag_arg = config_parser.add_argument("flag", nargs=1)
+    config_flag_arg.completer = make_config_flag_completer(  # type: ignore[attr-defined]
+        all_parsers
+    )
+    config_parser.add_argument("value", nargs="?")
+    config_parser.add_argument("--global", "-g", action="store_true", dest="use_global")
+    config_parser.add_argument("--repo", "-r", action="store_true")
+    config_parser.add_argument("--repo-local", "-l", action="store_true")
+    config_parser.add_argument("--delete", "-d", action="store_true")
+
+    toolkit_subparsers = toolkit_parser.add_subparsers(dest="toolkit_cmd", required=True)
+    detect_branch = toolkit_subparsers.add_parser(
+        "detect-branch", description="Detect the base branch of the current branch."
+    )
+    detect_branch.add_argument(
+        "--show-all",
+        "-s",
+        action="store_true",
+        help="Show all candidates, not just the best one",
+    )
+    detect_branch.add_argument(
+        "--no-limit", "-n", action="store_true", help="Don't limit to release branches"
+    )
+    toolkit_cherry_pick = toolkit_subparsers.add_parser(
+        "cherry-pick", description="Cherry pick given commit to a new parent"
+    )
+    toolkit_cherry_pick.add_argument("--commit", "-c", help="Commit to cherry-pick", required=True)
+    toolkit_cherry_pick.add_argument("--parent", "-p", help="Parent commit", required=True)
+    toolkit_diff_target = toolkit_subparsers.add_parser(
+        "diff-target", description="Make a virtual diff target from the given commits"
+    )
+    toolkit_diff_target.add_argument("--old-head", "-oh", help="Old head commit", required=True)
+    toolkit_diff_target.add_argument(
+        "--old-base", "-ob", help="Old base commit (parent of old head by default)"
+    )
+    toolkit_diff_target.add_argument("--new-head", "-nh", help="New head commit", required=True)
+    toolkit_diff_target.add_argument(
+        "--new-base", "-nb", help="New base commit (parent of old head by default)"
+    )
+    toolkit_diff_target.add_argument("--parent", "-p", help="Parent commit")
+    toolkit_fork_point = toolkit_subparsers.add_parser(
+        "fork-point", description="Find the first divergence between two branches"
+    )
+    toolkit_fork_point.add_argument("branches", nargs=2, help="Branches to compare")
+    toolkit_closest_branch = toolkit_subparsers.add_parser(
+        "closest-branch",
+        description="Find the nearest base branch to the given commit.",
+    )
+    toolkit_closest_branch.add_argument("branch", nargs=1, help="Commit/branch")
+    toolkit_closest_branch.add_argument(
+        "--allow-self",
+        action="store_true",
+        help='Allow the branch itself to be a valid "closest"',
+    )
+    toolkit_list_topics = toolkit_subparsers.add_parser(
+        "list-topics", description="List all topics and their commits"
+    )
+    toolkit_list_topics.add_argument(
+        "--base-branch",
+        "-b",
+        help="Use the given branch as the base instead of autodetecting.",
+    )
+    toolkit_list_topics.add_argument(
+        "--relative-branch", "-e", help="Use the given relative branch."
+    )
+    list_topics_commit_options = toolkit_list_topics.add_mutually_exclusive_group()
+    list_topics_commit_options.add_argument(
+        "--commit-ids",
+        "-c",
+        action="store_true",
+        help="Print the IDs for all commits within a topic",
+    )
+    list_topics_commit_options.add_argument(
+        "--titles",
+        "-t",
+        action="store_true",
+        help="Print the titles for all commits within a topic",
+    )
+
+    if "_ARGCOMPLETE" in os.environ:
+        import argcomplete
+
+        # Apply config before completing so completers resolve the same settings
+        # (main branch, remote, base branch globs) that normal commands use.
+        try:
+            conf = asyncio.run(get_config())
+            conf.apply_to_parsers(all_parsers)
+        except (OSError, RuntimeError, ValueError, RevupUsageException):
+            pass
+
+        argcomplete.autocomplete(
+            revup_parser,
+            always_complete_options=False,
+            exclude=revup_parser.collect_excluded_completions(),
+        )
+
+    return revup_parser, all_parsers
+
+
+async def main(revup_parser: RevupArgParser, all_parsers: list[RevupArgParser]) -> int:
+    # Do an initial parsing pass, which handles HelpAction
+    args = revup_parser.parse_args()
+    conf = await get_config()
+    logs.configure_logger(False, {})
+
+    if args.cmd == "install-completion":
+        return install_completion(args.shell, args.rc_file, conf)
+
+    # Run config before setting the config, in order to avoid the situation where a broken
+    # config prevents you from running config at all.
+    if args.cmd == "config":
+        return config.config_main(conf, args, all_parsers)
+
+    conf.apply_to_parsers(all_parsers)
+    args = revup_parser.parse_args()
+
+    # So users don't accidentally leak their oauth when sharing logs
+    logs.configure_logger(
+        debug=args.verbose,
+        redactions={args.forge_oauth: "<GITHUB_OAUTH>"} if args.forge_oauth else {},
+        log_to_file=args.log_to_file,
+    )
+
+    if args.cmd != "toolkit":
+        # Don't leak the prompt into util output as these are used in other scripts
+        maybe_prompt_user_for_completions(conf)
+
+    dump_args(args)
+
+    git_ctx = await git.make_git(args)
+
+    if args.cmd == "toolkit":
+        from revup import toolkit
+
+        return await toolkit.main(args=args, git_ctx=git_ctx)
+
+    if args.cmd == "optimize-stack":
+        from revup import optimize_stack
+
+        return await optimize_stack.main(args=args, git_ctx=git_ctx)
+
+    if args.cmd == "cherry-pick":
+        from revup import cherry_pick
+
+        return await cherry_pick.main(args=args, git_ctx=git_ctx, conf=conf)
+
+    if args.cmd in ["commit", "amend"]:
+        from revup import amend
+
+        # "commit" is an alias of "amend --insert"
+        args.insert = args.cmd == "commit" or args.insert
+
+        remote_url = await git_ctx.get_remote_url(args.remote_name)
+        repo_info = parse_forge_info(remote_url, args.forge_url)
+
+        if not repo_info.owner or not repo_info.name:
+            # Don't try to get topics for repos that are not in use with a forge
+            args.parse_topics = False
+
+        return await amend.main(args=args, git_ctx=git_ctx)
+
+    if args.cmd == "restack":
+        from revup import restack
+
+        return await restack.main(args=args, git_ctx=git_ctx)
+
+    from revup.forge_utils import forge_connection
+
+    async with forge_connection(args=args, git_ctx=git_ctx, conf=conf) as forge:
+        if args.cmd == "upload":
+            from revup import upload
+
+            return await upload.main(
+                args=args,
+                git_ctx=git_ctx,
+                forge=forge,
+            )
+
+    return 1

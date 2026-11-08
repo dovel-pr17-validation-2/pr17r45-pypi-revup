@@ -1,0 +1,332 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import shlex
+import subprocess
+import sys
+import time
+from collections.abc import Callable, Coroutine, Sequence
+from typing import IO, Any, TypeVar, Union
+
+# Evaluated at runtime instead of being a lazy annotation, so `X | Y` isn't usable until py3.10.
+_HANDLE = Union[None, int, IO[Any]]
+
+
+def debug_enabled() -> bool:
+    """
+    Whether any logging backend consumes debug logs. Verbose messages can be expensive
+    to format (decoding entire command outputs), so skip them if nobody will see them.
+    """
+    return logging.getLogger().isEnabledFor(logging.DEBUG)
+
+
+def log_command(args: Sequence[str]) -> None:
+    """
+    Given a command, print it in a both machine and human readable way.
+
+    Args:
+        *args: the list of command line arguments you want to run
+        env: the dictionary of environment variable settings for the command
+    """
+    logging.debug(f"$ {' '.join(shlex.quote(arg) for arg in args)}")
+
+
+K = TypeVar("K")
+
+
+V = TypeVar("V")
+
+
+def merge_dicts(x: dict[K, V], y: dict[K, V]) -> dict[K, V]:
+    z = x.copy()
+    z.update(y)
+    return z
+
+
+async def process_stream(
+    proc_stream: asyncio.StreamReader | None,
+    setting: _HANDLE,
+    default_stream: IO[str],
+    transform: Callable[[bytes], bytes] | None,
+) -> bytes:
+    # The things we do for logging...
+    #
+    # - I didn't make a PTY, so programs are going to give
+    #   output assuming there isn't a terminal at the other
+    #   end.  This is less nice for direct terminal use, but
+    #   it's better for logging (since we get to dispense
+    #   with the control codes).
+    #
+    # - We assume line buffering.  This is kind of silly but
+    #   we need to assume *some* sort of buffering with the
+    #   stream API.
+    output = []
+    if proc_stream is None:
+        return b""
+    while True:
+        try:
+            line = await proc_stream.readuntil()
+        except asyncio.LimitOverrunError as e:
+            line = await proc_stream.readexactly(e.consumed)
+        except asyncio.IncompleteReadError as e:
+            line = e.partial
+        if transform:
+            line = transform(line)
+        if not line:
+            if isinstance(setting, int) and setting not in (-1, subprocess.PIPE, subprocess.STDOUT):
+                os.close(setting)
+            break
+        if setting == subprocess.PIPE:
+            output.append(line)
+        elif setting == subprocess.STDOUT:
+            logging.info(line.decode("utf-8").strip())
+        elif isinstance(setting, int) and setting != -1:
+            os.write(setting, line)
+        elif setting is None:
+            # See https://stackoverflow.com/questions/55681488
+            default_stream.write(line.decode("utf-8"))
+        elif isinstance(setting, IO):
+            # don't use setting.write directly, that will
+            # not properly handle binary.  This gives us
+            # "parity" with the normal subprocess implementation
+            os.write(setting.fileno(), line)
+    return b"".join(output)
+
+
+async def feed_input(stdin_writer: asyncio.StreamWriter | None, input_str: str | None) -> None:
+    if stdin_writer is None:
+        return
+    if not input_str:
+        return
+    stdin_writer.write(input_str.encode("utf-8"))
+    await stdin_writer.drain()
+    stdin_writer.close()
+
+
+class Shell:
+    """
+    An object representing a shell (e.g., the bash prompt in your
+    terminal), maintaining a concept of current working directory, and
+    also the necessary accoutrements for testing.
+    """
+
+    # Current working directory of shell.
+    cwd: str
+
+    def __init__(
+        self,
+        quiet: bool = True,
+        cwd: str | None = None,
+    ):
+        """
+        Args:
+            cwd: Current working directory of the shell.  Pass None to
+                initialize to the current cwd of the current process.
+            quiet: If True, don't ask subprocesses to be verbose about what
+                they're doing, since that output goes straight to the user's
+                terminal. Note this doesn't affect debug logging of commands
+                and their output, which is governed by the log level.
+        """
+        self.quiet = quiet
+        self.cwd = cwd or os.getcwd()
+
+    async def create_sh_task(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        stderr: _HANDLE = None,
+        # TODO: Arguably bytes should be accepted here too
+        input_str: str | None = None,
+        stdin: _HANDLE = None,
+        stdout: _HANDLE = subprocess.PIPE,
+        output_transform: Callable[[bytes], bytes] | None = None,
+    ) -> tuple[
+        Coroutine[Any, Any, None],
+        Coroutine[Any, Any, bytes],
+        Coroutine[Any, Any, bytes],
+        Coroutine[Any, Any, int],
+    ]:
+        assert not (stdin and input_str)
+        if input_str:
+            stdin = subprocess.PIPE
+
+        if env is not None:
+            env = merge_dicts(dict(os.environ), env)
+
+        proc = asyncio.create_subprocess_exec(
+            *args,
+            stdin=stdin,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self.cwd,
+            env=env,
+        )
+
+        ret = await proc
+
+        return (
+            feed_input(ret.stdin, input_str),
+            process_stream(ret.stdout, stdout, sys.stdout, output_transform),
+            process_stream(ret.stderr, stderr, sys.stderr, output_transform),
+            ret.wait(),
+        )
+
+    async def sh(
+        self,
+        *args: str,
+        env: dict[str, str] | None = None,
+        stderr: _HANDLE = None,
+        # TODO: Arguably bytes should be accepted here too
+        input_str: str | None = None,
+        stdin: _HANDLE = None,
+        stdout: _HANDLE = subprocess.PIPE,
+        raiseonerror: bool = True,
+        quiet: bool = False,
+        output_transform: Callable[[bytes], bytes] | None = None,
+    ) -> tuple[int, str]:
+        """
+        Run a command specified by args, and return string representing
+        the stdout of the run command, raising an error if exit code
+        was nonzero.
+
+        Args:
+            *args: the list of command line arguments to run
+            env: any extra environment variables to set when running the
+                command.  Environment variables set this way are ADDITIVE
+                (unlike subprocess default)
+            stderr: where to pipe stderr; by default, we pipe it straight
+                to this process's stderr
+            input: string value to pass stdin.  This is mutually exclusive
+                with stdin
+            stdin: where to pipe stdin from.  This is mutually exclusive
+                with input
+            stdout: where to pipe stdout; by default, we capture the stdout
+                and return it
+            raiseonerror: whether to raise an error if return value is not 0
+        """
+        if debug_enabled():
+            log_command(args)
+        start_time = time.time()
+        tasks = await self.create_sh_task(
+            *args,
+            env=env,
+            stderr=stderr,
+            input_str=input_str,
+            stdin=stdin,
+            stdout=stdout,
+            output_transform=output_transform,
+        )
+
+        _, out, err, ret = await asyncio.gather(*tasks)
+
+        ret = self.handle_sh_results(ret, out, err, stdout, raiseonerror, quiet, *args)
+        if debug_enabled():
+            logging.debug(f"Took {time.time() - start_time}s")
+        return ret
+
+    async def piped_sh(
+        self,
+        args1: list[str],
+        args2: list[str],
+        env1: dict[str, str] | None = None,
+        env2: dict[str, str] | None = None,
+        stderr: _HANDLE = None,
+        # TODO: Arguably bytes should be accepted here too
+        input_str: str | None = None,
+        stdin: _HANDLE = None,
+        stdout: _HANDLE = subprocess.PIPE,
+        raiseonerror: bool = True,
+        quiet: bool = False,
+    ) -> tuple[int, str]:
+        start_time = time.time()
+        read, write = os.pipe()
+        log_args = [*args1, "|", *args2]
+        if debug_enabled():
+            log_command(log_args)
+
+        tasks = await asyncio.gather(
+            self.create_sh_task(
+                *args1, env=env1, stderr=stderr, input_str=input_str, stdin=stdin, stdout=write
+            ),
+            self.create_sh_task(*args2, env=env2, stderr=stderr, stdin=read, stdout=stdout),
+        )
+
+        _, _, err1, ret1, _, out2, err2, ret2 = await asyncio.gather(*tasks[0], *tasks[1])
+
+        # Different mypy versions waffle between treating the result of gather as a Tuple
+        # (and thus separating types by index) or List (and thus treating all elements as
+        # all possible types). These asserts ensure lint passes in the second case.
+        assert isinstance(ret1, int) and isinstance(ret2, int)
+        assert isinstance(err1, bytes) and isinstance(err2, bytes)
+        assert isinstance(out2, bytes)
+
+        ret = self.handle_sh_results(
+            ret2 if ret1 == 0 else ret1, out2, err1 + err2, stdout, raiseonerror, quiet, *log_args
+        )
+        os.close(read)
+        if debug_enabled():
+            logging.debug(f"Took {time.time() - start_time}s")
+        return ret
+
+    def handle_sh_results(
+        self,
+        returncode: int,
+        out: bytes,
+        err: bytes,
+        stdout: _HANDLE,
+        raiseonerror: bool,
+        quiet: bool,
+        *args: str,
+    ) -> tuple[int, str]:
+        if returncode and err:
+            logging.warning(err.decode(errors="backslashreplace"))
+        elif not quiet and debug_enabled() and err:
+            logging.debug(f"# stderr:\n{err.decode(errors='backslashreplace')}")
+        if not quiet and debug_enabled() and out:
+            logging.debug(
+                "{}{}".format(
+                    ("# stdout:\n" if err else ""),
+                    out.decode(errors="backslashreplace").replace("\0", "\\0"),
+                )
+            )
+
+        if returncode != 0 and raiseonerror:
+            raise RuntimeError(f"{' '.join(args)} failed with exit code {returncode}")
+
+        if stdout == subprocess.PIPE:
+            # Decode leniently: git output is usually UTF-8 but can contain
+            # arbitrary bytes. A strict decode would crash; replace keeps output
+            # displayable.
+            return (returncode, out.decode(errors="replace"))
+        return (returncode, "")
+
+    def open(self, fn: str, mode: str) -> IO[Any]:
+        """
+        Open a file, relative to the current working directory.
+
+        Args:
+            fn: filename to open
+            mode: mode to open the file as
+        """
+        return open(os.path.join(self.cwd, fn), mode)
+
+    def cd(self, d: str) -> None:
+        """
+        Change the current working directory.
+
+        Args:
+            d: directory to change to
+        """
+        self.cwd = os.path.join(self.cwd, d)
+
+    def wait_for_confirmation(self) -> int:
+        """
+        Block until the user presses enter. Return whether the operation should continue.
+        """
+        try:
+            input("Press <Enter> to continue or <Ctrl-C> to quit")
+        except KeyboardInterrupt:
+            return 1
+        return 0

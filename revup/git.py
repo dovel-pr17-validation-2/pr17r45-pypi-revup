@@ -1,0 +1,957 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import copy
+import logging
+import os
+import re
+import shutil
+import tempfile
+from typing import Any, cast
+
+from async_lru import alru_cache as lru_cache
+
+from revup import shell
+from revup.core_types import (
+    CommitHeader,
+    GitCommitHash,
+    GitConflict,
+    GitConflictException,
+    GitTreeHash,
+    RevupUsageException,
+)
+
+RE_RAW_COMMIT_ID = re.compile(r"^(?P<commit>[a-f0-9]+)$", re.MULTILINE)
+RE_RAW_AUTHOR = re.compile(
+    r"^author (?P<author>(?P<name>[^<]+?) <(?P<email>[^>]+)> (?P<date>[0-9]+ [+-][0-9]+))$",
+    re.MULTILINE,
+)
+RE_RAW_COMMITTER = re.compile(
+    r"^committer (?P<author>(?P<name>[^<]+?) <(?P<email>[^>]+)> (?P<date>[0-9]+ [+-][0-9]+))$",
+    re.MULTILINE,
+)
+RE_RAW_PARENT = re.compile(r"^parent (?P<commit>[a-f0-9]+)$", re.MULTILINE)
+RE_RAW_TREE = re.compile(r"^tree (?P<tree>.+)$", re.MULTILINE)
+RE_RAW_COMMIT_MSG_LINE = re.compile(r"^    (?P<line>.*)$", re.MULTILINE)
+
+RE_COMMIT_HASH = re.compile(r"^[0-9a-f]{8,}")
+RE_REMOTE_REF = re.compile(r"^refs/remotes/(?P<branch>.*)$")
+
+HEAD_COMMIT = GitCommitHash("HEAD")
+
+GIT_ENV_NOCONFIG = {
+    "HOME": "/dev/null",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
+
+COMMON_MAIN_BRANCHES = ["main", "master"]  # Below logic assumes 2 values here
+
+
+def parse_commit_header(raw_header: str) -> CommitHeader:
+    def _search_group(raw_header: str, regex: re.Pattern[str], group: str) -> str:
+        m = regex.search(raw_header)
+        assert m
+        return m.group(group)
+
+    tree = GitTreeHash(_search_group(raw_header, RE_RAW_TREE, "tree"))
+    commit_id = GitCommitHash(_search_group(raw_header, RE_RAW_COMMIT_ID, "commit"))
+    parents = [GitCommitHash(m.group("commit")) for m in RE_RAW_PARENT.finditer(raw_header)]
+    author_name = _search_group(raw_header, RE_RAW_AUTHOR, "name")
+    author_email = _search_group(raw_header, RE_RAW_AUTHOR, "email")
+    author_date = _search_group(raw_header, RE_RAW_AUTHOR, "date")
+    committer_name = _search_group(raw_header, RE_RAW_COMMITTER, "name")
+    committer_email = _search_group(raw_header, RE_RAW_COMMITTER, "email")
+    committer_date = _search_group(raw_header, RE_RAW_COMMITTER, "date")
+    # A commit may have an empty message (no indented lines), so derive the title
+    # and message from whatever lines exist rather than asserting one is present.
+    msg_lines = [m.group("line") for m in RE_RAW_COMMIT_MSG_LINE.finditer(raw_header)]
+    title = msg_lines[0] if msg_lines else ""
+    commit_msg = "\n".join(msg_lines)
+    return CommitHeader(
+        tree,
+        parents,
+        author_name,
+        author_email,
+        author_date,
+        committer_name,
+        committer_email,
+        committer_date,
+        commit_msg,
+        title,
+        commit_id,
+    )
+
+
+def parse_rev_list(s: str) -> list[CommitHeader]:
+    """
+    Parses output of rev-list -v and returns a list of commits
+    """
+    return list(map(parse_commit_header, s.split("\0")[:-1]))
+
+
+def commits_match(a: CommitHeader, b: CommitHeader) -> bool:
+    """
+    Returns whether author and commit message are the same for the given commits
+    """
+    return (
+        a.title == b.title
+        and a.author_name == b.author_name
+        and a.author_email == b.author_email
+        and a.committer_name == b.committer_name
+        and a.committer_email == b.committer_email
+        and a.commit_msg == b.commit_msg
+    )
+
+
+def is_commit_hash(commit_ish: GitCommitHash) -> bool:
+    """
+    Determine if the given commit-ish ref is a hash.
+    """
+    return re.match(RE_COMMIT_HASH, commit_ish) is not None
+
+
+def get_default_git() -> str:
+    ret = shutil.which("git")
+    if not ret:
+        raise RevupUsageException("Could not find a 'git' binary on the current PATH.")
+    return ret
+
+
+async def make_git(args: argparse.Namespace) -> Git:
+    sh = shell.Shell(not args.verbose)
+    git_path = args.git_path
+    git_version = args.git_version
+    remote_name = args.fork_name or args.remote_name
+    main_branch = args.main_branch
+    base_branch_globs = args.base_branch_globs
+    keep_temp = args.keep_temp
+    editor = args.editor
+
+    if not git_path:
+        git_path = get_default_git()
+
+    git_ctx = Git(sh, git_path, remote_name, main_branch, base_branch_globs, keep_temp)
+
+    async def get_email() -> str:
+        email = await git_ctx.git_stdout("config", "user.email", raiseonerror=False)
+        if not email:
+            raise RuntimeError(
+                "Couldn't get git email, set it with `git config --global user.email`"
+            )
+        return email
+
+    async def get_editor() -> str | None:
+        if editor:
+            return editor
+        # Defer to git's precedence order
+        ret, resolved = await git_ctx.git("var", "GIT_EDITOR", raiseonerror=False)
+        # git exits nonzero when the terminal is dumb and no editor is configured, and
+        # prints nothing if core.editor is explicitly set to empty. Either way there's no
+        # usable editor. Return None rather than raising, since most commands never open
+        # an editor; the failure is reported if and when we actually need one.
+        if ret != 0 or not resolved:
+            return None
+        return resolved
+
+    async def get_gpg_sign() -> bool:
+        # commit-tree (plumbing) ignores commit.gpgSign, so read it and pass -S ourselves.
+        val = await git_ctx.git_stdout(
+            "config", "--type=bool", "--get", "commit.gpgSign", raiseonerror=False
+        )
+        return val.strip() == "true"
+
+    # asyncio.gather is only precisely typed up to 6 awaitables; beyond that
+    # mypy infers each result as object, so annotate the tuple ourselves.
+    (
+        repo_root,
+        git_dir,
+        actual_version,
+        email,
+        resolved_editor,
+        main_exists,
+        gpg_sign,
+    ) = cast(
+        "tuple[str, str, str, str, str | None, bool, bool]",
+        await asyncio.gather(
+            git_ctx.git_stdout("rev-parse", "--show-toplevel"),
+            git_ctx.git_stdout("rev-parse", "--path-format=absolute", "--git-dir"),
+            git_ctx.git_stdout("--version"),
+            get_email(),
+            get_editor(),
+            git_ctx.is_branch_or_commit(f"{remote_name}/{main_branch}"),
+            get_gpg_sign(),
+        ),
+    )
+
+    if git_version:
+        version_arr = [int(v) for v in git_version.split(".")]
+        actual_version_arr = [int(v) for v in actual_version.split()[2].split(".")[:3]]
+        for v, a in zip(version_arr, actual_version_arr):
+            if a > v:
+                break
+            if a == v:
+                continue
+            raise RuntimeError(
+                f"revup requires git {version_arr}, you're running {actual_version_arr}"
+            )
+    git_ctx.repo_root = repo_root
+    sh.cwd = git_ctx.repo_root
+    git_ctx.git_dir = git_dir
+    git_ctx.email = email.lower()
+    git_ctx.author = git_ctx.email.split("@")[0]
+    git_ctx.editor = resolved_editor
+    git_ctx.gpg_sign = gpg_sign
+    if not main_exists and main_branch in COMMON_MAIN_BRANCHES:
+        git_ctx.main_branch = COMMON_MAIN_BRANCHES[1 - COMMON_MAIN_BRANCHES.index(main_branch)]
+        logging.info(
+            f'Branch {main_branch} not found, falling back to "{git_ctx.main_branch}".'
+            " We recommend you set this in .revupconfig"
+        )
+    return git_ctx
+
+
+class Git:
+    # Shell object to run git with
+    sh: shell.Shell
+
+    # Path for git executable
+    git_path: str
+
+    # Remote to use for most operations
+    remote_name: str
+
+    # Git branch configuration
+    main_branch: str
+    base_branch_globs: list[str]
+
+    # Whether to keep temporary files
+    keep_temp: bool
+
+    # Scratch directory for temporary files
+    temp_dir: tempfile.TemporaryDirectory
+
+    # Root directory of the git repo
+    repo_root: str
+
+    # .git directory of the repo. Note that this may not be in
+    # repo_root when inside a worktree
+    git_dir: str
+
+    email: str
+    author: str
+
+    # Editor to use for message editing, or None if git couldn't resolve one
+    editor: str | None
+
+    # Whether to GPG/SSH sign commits revup creates, from git config commit.gpgSign
+    gpg_sign: bool
+
+    def __init__(
+        self,
+        sh: shell.Shell,
+        git_path: str,
+        remote_name: str,
+        main_branch: str,
+        base_branch_globs: str,
+        keep_temp: bool,
+    ):
+        self.sh = sh
+        self.git_path = git_path
+        self.remote_name = remote_name
+        self.keep_temp = keep_temp
+        self.main_branch = main_branch
+        self.gpg_sign = False
+        self.base_branch_globs = base_branch_globs.strip().splitlines()
+        self.temp_dir = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+            prefix="revup_"
+        )
+        if self.keep_temp:
+            os.makedirs(self.get_scratch_dir(), exist_ok=True)
+
+    def clear_cache(self) -> None:
+        """
+        Clear caches for all functions that are decorated with lru_cache(). This is generally
+        overdoing it since its usually sufficient to only clear certain entries, however most usages
+        currently happen at the end of the program so it isn't worth optimizing now.
+        """
+        self.is_branch_or_commit.cache_clear()  # pylint: disable=no-member
+        self.to_commit_hash.cache_clear()  # pylint: disable=no-member
+        self.fork_point.cache_clear()  # pylint: disable=no-member
+        self.distance_to_fork_point.cache_clear()  # pylint: disable=no-member
+        self.have_identical_trees.cache_clear()  # pylint: disable=no-member
+        self.to_tree.cache_clear()  # pylint: disable=no-member
+        self.merge_tree.cache_clear()  # pylint: disable=no-member
+
+    def get_scratch_dir(self) -> str:
+        """
+        Get the name of the current scratch directory. Any contents will be deleted
+        when the program exits.
+        """
+        return f"{self.repo_root}/.revup" if self.keep_temp else self.temp_dir.name
+
+    async def git(
+        self,
+        *args: str,
+        no_config: bool = False,
+        env: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> tuple[int, str]:
+        """
+        Run a git command.  The returned stdout has trailing newlines stripped.
+
+        Args:
+            *args: Arguments to git
+            **kwargs: Any valid kwargs for sh()
+        """
+        git_env = {}
+        if no_config:
+            git_env.update(GIT_ENV_NOCONFIG)
+        if env is not None:
+            git_env.update(env)
+
+        def _maybe_rstrip(s: tuple[int, str]) -> tuple[int, str]:
+            return (s[0], s[1].rstrip())
+
+        return _maybe_rstrip(await self.sh.sh(*((self.git_path, *args)), env=git_env, **kwargs))
+
+    async def git_return_code(self, *args: str, **kwargs: Any) -> int:
+        return (await self.git(*args, raiseonerror=False, **kwargs))[0]
+
+    async def has_staged_changes(self) -> bool:
+        return (
+            await self.git_return_code("diff-index", "--cached", "--no-renames", "--quiet", "HEAD")
+            != 0
+        )
+
+    async def has_unstaged_changes(self) -> bool:
+        # Not converted to plumbing (diff-files/diff-index). This compares the
+        # worktree, where diff-index returns 1 on a stale mtime even with no content
+        # change, so it would report spurious unstaged changes.
+        return await self.git_return_code("diff", "--no-renames", "--quiet") != 0
+
+    async def git_stdout(self, *args: str, **kwargs: Any) -> str:
+        return (await self.git(*args, **kwargs))[1]
+
+    async def get_remote_url(self, remote_name: str) -> str:
+        """
+        Return the URL configured for the given remote, or empty string if not found.
+        """
+        ret = await self.git("config", "--get", f"remote.{remote_name}.url", raiseonerror=False)
+        if ret[0] != 0:
+            return ""
+        return ret[1]
+
+    async def rev_list(
+        self,
+        include: str,
+        exclude: str | None = None,
+        first_parent: bool = False,
+        exclude_first_parent: bool = False,
+        header: bool = False,
+        max_revs: int = 0,
+    ) -> str:
+        """
+        Wrapper for git rev-list
+        """
+        rev_list_args = ["rev-list", "--reverse", include]
+        if max_revs:
+            rev_list_args.extend(["-n", f"{max_revs}"])
+        if first_parent:
+            rev_list_args.append("--first-parent")
+        if exclude_first_parent:
+            rev_list_args.append("--exclude-first-parent-only")
+        if header:
+            rev_list_args.append("--header")
+        if exclude is not None:
+            rev_list_args.extend(["--not", exclude])
+        return await self.git_stdout(*rev_list_args)
+
+    @lru_cache(maxsize=None)
+    async def is_branch_or_commit(self, obj: str) -> bool:
+        return (
+            await self.git_return_code("rev-parse", "--verify", "--quiet", obj + "^{commit}") == 0
+        )
+
+    async def verify_branch_or_commit(self, obj: str) -> None:
+        if not await self.is_branch_or_commit(obj):
+            raise RevupUsageException(f"{obj} is not a commit or branch name!")
+
+    @lru_cache(maxsize=None)
+    async def to_commit_hash(self, ref: str) -> GitCommitHash:
+        ret, stdout = await self.git(
+            "rev-parse", "--verify", "--quiet", ref + "^{commit}", raiseonerror=False
+        )
+        if ret != 0:
+            raise RevupUsageException(f"{ref} is not a branch name!")
+
+        return GitCommitHash(stdout)
+
+    @lru_cache(maxsize=None)
+    async def to_tree(self, ref: str) -> GitTreeHash:
+        return GitTreeHash(await self.git_stdout("rev-parse", ref + "^{tree}"))
+
+    @lru_cache(maxsize=None)
+    async def fork_point(self, ref: str, baseRef: str) -> GitCommitHash:
+        """
+        Define the fork-point of your branch and a base branch as the commit at
+        which the two branches first diverged in history.
+        To find this, get the list of commits reachable from your branch,
+        but not reachable from the base branch. The fork point is the parent of
+        the last commit in that list, and the length of that commit list is
+        the number of changes being introduced by your branch.
+        If that list of commits ends up being empty, it means your branch has not
+        introduced any new commits, so the fork point is just your ref.
+
+        Returns the fork point of ref and baseRef.
+        """
+        return (await self.nearest_fork_point(ref, [baseRef]))[1]
+
+    async def nearest_fork_point(self, ref: str, baseRefs: list[str]) -> tuple[int, GitCommitHash]:
+        """
+        Like fork_point, but for many base branches at once. Excluding all of them from a
+        single rev-list lists the commits that ref introduced over the nearest of them, so
+        the length of that list is the shortest distance to a fork point, and the parent of
+        its oldest commit is that fork point. An empty list means ref is already on one of
+        the branches, so it is its own fork point at distance zero.
+
+        Returns the distance to the nearest of baseRefs and the fork point with it.
+        """
+        introduced = await self.git_stdout(
+            "rev-list",
+            "--first-parent",
+            "--exclude-first-parent-only",
+            ref,
+            *(f"^{b}" for b in baseRefs),
+            "--reverse",
+        )
+        commits = [c for c in introduced.split("\n") if c]
+        if not commits:
+            return 0, GitCommitHash(ref)
+        return len(commits), GitCommitHash(f"{commits[0]}~")
+
+    @lru_cache(maxsize=None)
+    async def distance_to_fork_point(self, ref: str, baseRef: str, max_n: int = 0) -> int:
+        """
+        Return number of commits between ref and its fork point with baseRef, up to the given max.
+        """
+        max_args = ["-n", f"{max_n + 1}"] if max_n else []
+        ret = await self.git_stdout(
+            "rev-list",
+            "--first-parent",
+            "--exclude-first-parent-only",
+            ref,
+            "^" + baseRef,
+            "--count",
+            *max_args,
+        )
+        return int(ret)
+
+    async def is_ancestor(self, ref: str, ancestor: str) -> bool:
+        """
+        Return whether ref is a first parent ancestor of the given ancestor.
+
+        This is different from merge-base --is-ancestor since that checks all
+        parents, not just the first.
+        """
+        if ref == ancestor:
+            return True
+        return await self.distance_to_fork_point(ref, ancestor, 1) == 0
+
+    @lru_cache(maxsize=None)
+    async def have_identical_trees(self, ref1: GitCommitHash, ref2: GitCommitHash) -> bool:
+        """
+        Return whether two commit-ish have the same trees, which indicate that
+        they have no diff.
+        """
+        tree1 = await self.git_stdout("rev-parse", f"{ref1}^{{tree}}")
+        tree2 = await self.git_stdout("rev-parse", f"{ref2}^{{tree}}")
+        return tree1 == tree2
+
+    def ensure_branch_prefix(self, branch: str) -> str:
+        """
+        Ensure the branch is prefixed with the remote name.
+        """
+        if branch.startswith(self.remote_name + "/"):
+            return branch
+        return f"{self.remote_name}/{branch}"
+
+    def remove_branch_prefix(self, branch: str) -> str:
+        """
+        Ensure the branch is not prefixed with the remote name.
+        """
+        if not branch.startswith(self.remote_name + "/"):
+            return branch
+        return branch[len(f"{self.remote_name}/") :]
+
+    async def branches_from_for_each_ref(self, ref_filters: list[str]) -> list[str]:
+        """
+        Return the names of all remote branches that match the given for-each-ref patterns
+        and options.
+        """
+        ret: list[str] = []
+        for ref in (
+            await self.git_stdout("for-each-ref", "--format", "%(refname)", *ref_filters)
+        ).split("\n"):
+            result = RE_REMOTE_REF.search(ref)
+            if result is not None:
+                ret.append(result.group("branch"))
+        return ret
+
+    async def find_remote_branches(
+        self, commit: str, limit_to_base_branches: bool, prune_old: bool
+    ) -> list[str]:
+        """
+        Finds all branches that are candidates for auto-detected base branch of the given commit.
+        Optionally, limit_to_base_branches will only select those branches which match
+        a branch naming glob given in the config.
+        prune_old will discard invalid branches to speed up the selection process.
+        Return a list of branch names
+        """
+        ref_filters: list[str] = []
+
+        if limit_to_base_branches:
+            if not self.base_branch_globs:
+                return [f"{self.remote_name}/{self.main_branch}"]
+            ref_filters.append(f"refs/remotes/{self.remote_name}/{self.main_branch}")
+            ref_filters.extend(
+                f"refs/remotes/{self.remote_name}/{b}" for b in self.base_branch_globs
+            )
+        else:
+            ref_filters.append(f"refs/remotes/{self.remote_name}/{self.main_branch}")
+            ref_filters.append(f"refs/remotes/{self.remote_name}/*")
+
+        if prune_old:
+            fork_with_main = await self.fork_point(commit, f"{self.remote_name}/{self.main_branch}")
+            # A branch that doesn't contain the fork with main must be too old
+            ref_filters.extend(
+                (
+                    "--contains",
+                    fork_with_main,
+                )
+            )
+
+        return await self.branches_from_for_each_ref(ref_filters)
+
+    async def get_best_base_branch_candidates(
+        self, commit: str, limit_to_base_branches: bool = True, allow_self: bool = True
+    ) -> list[str]:
+        """
+        Find the best base branch for the given commit by listing candidate remote branches
+        Return the branch(es) with the shortest distance from the commit to fork-point
+        """
+        branches = await self.find_remote_branches(commit, limit_to_base_branches, True)
+
+        if len(branches) == 1:
+            return branches
+
+        if not allow_self:
+            branches = [b for b in branches if b != commit]
+        if not branches:
+            return []
+
+        best, fork_point = await self.nearest_fork_point(commit, branches)
+
+        # Every branch tied at the best distance contains the fork point, so --contains
+        # narrows the field to a superset of the answer. It's only a superset because
+        # --contains tests full ancestry while the distance follows first parents only, so
+        # measure each survivor exactly to drop the ones that contain it off-chain.
+        maybe_tied = await self.branches_from_for_each_ref(
+            ["--contains", fork_point] + [f"refs/remotes/{b}" for b in branches]
+        )
+        dists = await asyncio.gather(*(self.distance_to_fork_point(commit, b) for b in maybe_tied))
+        return [b for b, dist in zip(maybe_tied, dists) if dist == best]
+
+    async def get_best_base_branch(
+        self,
+        commit: str,
+        limit_to_base_branches: bool = True,
+        allow_self: bool = True,
+    ) -> str:
+        """
+        If the current branch or main is among the best branches, choose that.
+        Otherwise choose the last lexographically.
+        """
+        candidates = await self.get_best_base_branch_candidates(
+            commit, limit_to_base_branches, allow_self
+        )
+        ret = candidates[0]
+        if len(candidates) == 1:
+            return ret
+        # symbolic-ref errors (rc != 0) on a detached HEAD; treat that as no branch.
+        ret_code, branch_out = await self.git(
+            "symbolic-ref", "-q", "--short", "HEAD", raiseonerror=False
+        )
+        current_branch = branch_out if ret_code == 0 else None
+        for c in candidates:
+            if (
+                current_branch is not None and c == f"{self.remote_name}/{current_branch}"
+            ) or c == f"{self.remote_name}/{self.main_branch}":
+                ret = c
+                break
+            ret = max(ret, c)
+        return ret
+
+    async def commit_tree(self, commit_info: CommitHeader) -> GitCommitHash:
+        """
+        Run git commit-tree with the args in commit_info.
+        """
+        git_env = {
+            "GIT_AUTHOR_NAME": commit_info.author_name,
+            "GIT_AUTHOR_EMAIL": commit_info.author_email,
+            "GIT_AUTHOR_DATE": commit_info.author_date,
+            "GIT_COMMITTER_NAME": commit_info.committer_name,
+            "GIT_COMMITTER_EMAIL": commit_info.committer_email,
+            "GIT_COMMITTER_DATE": commit_info.committer_date,
+        }
+        git_env = {k: v for k, v in git_env.items() if v != ""}
+        commit_tree_args = [
+            "commit-tree",
+            commit_info.tree,
+            "-m",
+            commit_info.commit_msg,
+        ]
+        if self.gpg_sign:
+            commit_tree_args.append("-S")
+        for p in commit_info.parents:
+            commit_tree_args.extend(["-p", p])
+        ret = await self.git_stdout(*commit_tree_args, env=git_env)
+        return GitCommitHash(ret)
+
+    @lru_cache(maxsize=None)
+    async def empty_tree(self) -> GitTreeHash:
+        """
+        Return the hash of the empty tree, computed so it works under any hash algorithm.
+        """
+        return GitTreeHash(await self.git_stdout("mktree", input_str=""))
+
+    async def make_tree_from_index_entries(self, entries: list[str]) -> GitTreeHash:
+        """
+        Build a tree from raw `ls-files --stage` formatted index entries
+        (`<mode> <blob> <stage>\\t<path>`), without touching any index.
+
+        `git mktree` only builds a single tree level and rejects paths with
+        slashes, so nested paths are grouped by directory and the trees are
+        built bottom-up, writing one subtree object per directory.
+        """
+        # Nested dict: dir name -> subtree dict, plus "" -> list of blob lines
+        # for the files directly in that directory.
+        root: dict[str, Any] = {}
+        for entry in entries:
+            meta, path = entry.split("\t", 1)
+            mode, blob, _stage = meta.split(" ")
+            *dirs, name = path.split("/")
+            node = root
+            for d in dirs:
+                node = node.setdefault(d, {})
+            node.setdefault("", []).append(f"{mode} blob {blob}\t{name}")
+
+        async def build(node: dict[str, Any]) -> GitTreeHash:
+            lines = list(node.get("", []))
+            for name, child in node.items():
+                if name == "":
+                    continue
+                subtree = await build(child)
+                lines.append(f"040000 tree {subtree}\t{name}")
+            # An empty input produces the empty tree; a lone blank line is an error.
+            input_str = "\n".join(lines) + "\n" if lines else ""
+            return GitTreeHash(await self.git_stdout("mktree", input_str=input_str))
+
+        return await build(root)
+
+    async def make_tree_from_paths(self, tree: GitTreeHash, paths: list[str]) -> GitTreeHash:
+        """
+        Build a tree containing only `paths`, each with the content it has in
+        `tree`. Returns the empty tree if `paths` is empty.
+        """
+        if not paths:
+            return await self.empty_tree()
+        # -z gives NUL-terminated, unquoted paths so names with special chars or
+        # unicode aren't C-quoted, matching make_tree_from_index_entries's format.
+        ls_output = await self.git_stdout("ls-tree", "-r", "-z", tree, "--", *paths)
+        entries = []
+        for line in ls_output.split("\0"):
+            if not line:
+                continue
+            meta, path = line.split("\t", 1)
+            mode, _type, blob = meta.split(" ")
+            entries.append(f"{mode} {blob} 0\t{path}")
+        return await self.make_tree_from_index_entries(entries)
+
+    @lru_cache(maxsize=None)
+    async def merge_tree(
+        self,
+        merge_base: GitCommitHash,
+        tree1: GitCommitHash,
+        tree2: GitCommitHash,
+        strategy: str | None = None,
+    ) -> tuple[GitTreeHash, list[GitConflict] | None]:
+        """
+        Run merge-tree and return the resulting tree hash and any conflicts.
+        Conflicts is None if merge succeeded (ret 0), or a list (possibly empty) on conflict.
+        """
+        args = [
+            "merge-tree",
+            "--write-tree",
+            "--messages",
+            "-z",
+            "--merge-base",
+            merge_base,
+        ]
+        if strategy is not None:
+            args.extend([f"-X{strategy}"])
+        args.extend([tree1, tree2])
+
+        ret, stdout = await self.git(*args, no_config=True, raiseonerror=False)
+        if ret > 1:
+            raise RuntimeError(f"Unexpected / unknown error in git {args} {ret}")
+
+        sections = stdout.split("\0\0")
+        subsections = [s.split("\0") for s in sections]
+        tree_hash = GitTreeHash(subsections[0][0])
+
+        if ret == 0:
+            return tree_hash, None
+
+        conflicts: list[GitConflict] = []
+        informational = subsections[1]
+        i = 0
+        while i < len(informational) - 1:
+            num_paths = int(informational[i])
+            conflicts.append(
+                GitConflict(
+                    informational[i + 1 + num_paths],
+                    informational[i + 2 + num_paths].strip(),
+                    informational[i + 1 : i + 1 + num_paths],
+                )
+            )
+            i += num_paths + 3
+
+        return tree_hash, conflicts
+
+    async def commits_are_equivalent(
+        self,
+        local_commit: CommitHeader,
+        remote_commit: CommitHeader,
+    ) -> bool:
+        """
+        Check if local_commit produces the same diff as remote_commit by applying
+        local_commit onto remote_commit's parent via merge-tree and comparing trees.
+        """
+        if not local_commit.parents or not remote_commit.parents:
+            return False
+
+        result_tree, conflicts = await self.merge_tree(
+            local_commit.parents[0],
+            local_commit.commit_id,
+            remote_commit.parents[0],
+        )
+        return conflicts is None and result_tree == remote_commit.tree
+
+    async def get_diff_summary(
+        self,
+        parent: GitCommitHash,
+        commit: GitCommitHash,
+    ) -> str:
+        """
+        Return the summary of the diff (files and lines changed)
+        """
+        return (
+            await self.git_stdout(
+                "diff-tree", "-r", "-M", "--shortstat", parent, commit, no_config=True
+            )
+        ).rstrip()
+
+    async def merge_tree_commit(
+        self,
+        tree1: GitCommitHash,
+        tree2: GitCommitHash,
+        new_commit_info: CommitHeader,
+        merge_base: GitCommitHash,
+        strategy: str | None = None,
+        ignore_conflicts: bool = False,
+    ) -> GitCommitHash:
+        """
+        Perform a combined git merge-tree and commit-tree, returning a git commit hash. Raises
+        GitConflictException if there are conflicts while merging the trees.
+        """
+        tree_hash, conflicts = await self.merge_tree(merge_base, tree1, tree2, strategy)
+
+        if conflicts is None or ignore_conflicts:
+            new_commit_info.tree = tree_hash
+            return await self.commit_tree(new_commit_info)
+
+        e = GitConflictException(tree_hash)
+        e.conflicts = conflicts
+        raise e
+
+    async def dump_conflict(self, e: GitConflictException) -> None:
+        """
+        Dump conflict to log for informational purposes. For conflicts that have content markers,
+        Look up those sections in the result tree and dump those as well.
+        """
+        for conflict in e.conflicts:
+            if conflict.type == "Auto-merging":
+                # A purely informational message, doesn't indicate a conflict
+                continue
+
+            logging.error(conflict.message)
+
+            if conflict.type == "CONFLICT (contents)":
+                # Look up conflict markers in tree
+                await self.dump_conflict_markers(e.tree, conflict.paths[0])
+
+    async def dump_conflict_markers(self, tree: GitTreeHash, path: str) -> None:
+        """
+        Given a tree and file within the tree, print out all groups of conflict markers,
+        prefixed with the starting and ending line numbers.
+        """
+        groups: list[list[int]] = []
+        conflict_depth = 0
+        lines = (await self.git_stdout("cat-file", "-p", f"{tree}:{path}")).split("\n")
+        for lineno, line in enumerate(lines):
+            if line.startswith("<" * 7):
+                if conflict_depth == 0:
+                    groups.append([lineno])
+                conflict_depth += 1
+            if line.startswith(">" * 7) and conflict_depth > 0:
+                conflict_depth -= 1
+                if conflict_depth == 0:
+                    groups[-1].append(lineno + 1)
+
+        ret = []
+        for group in groups:
+            if len(group) != 2:
+                continue
+            ret.append(f"@@ {group[0]}, {group[1]}")
+            ret.extend(lines[i] for i in range(group[0], group[1]))
+
+        logging.info("\n".join(ret))
+
+    async def synthetic_amend(
+        self, commit_to_amend: CommitHeader, new_commit: CommitHeader
+    ) -> GitCommitHash:
+        """
+        Return a commit that contains the contents of both commit_to_amend and new_commit
+        """
+        commit_info = copy.deepcopy(commit_to_amend)
+        return await self.merge_tree_commit(
+            new_commit.commit_id,
+            commit_info.commit_id,
+            commit_info,
+            new_commit.parents[0],
+        )
+
+    async def synthetic_cherry_pick_from_commit(
+        self, commit_info: CommitHeader, new_parent: GitCommitHash
+    ) -> GitCommitHash:
+        """
+        Return a commit that contains the contents of the given commit on top of a new parent.
+        """
+        commit_info = copy.deepcopy(commit_info)
+        old_parent = commit_info.parents[0]
+        commit_info.parents[0] = new_parent
+        return await self.merge_tree_commit(
+            commit_info.commit_id, new_parent, commit_info, old_parent
+        )
+
+    async def cherry_pick_from_tree(
+        self, commit_info: CommitHeader, new_parent: GitCommitHash
+    ) -> GitCommitHash:
+        """
+        Return a commit that uses the same tree as the given commit, but is on a new parent.
+        """
+        new_commit_info = copy.deepcopy(commit_info)
+        new_commit_info.parents[0] = new_parent
+        return await self.commit_tree(new_commit_info)
+
+    async def reparent_commits(
+        self, commits: list[CommitHeader], new_parent: GitCommitHash
+    ) -> GitCommitHash:
+        """
+        Recreate the commits in order on top of a new parent, keeping each one's tree, and
+        return the new tip. Much faster than cherry-picking when only metadata changed.
+        """
+        for commit_info in commits:
+            new_parent = await self.cherry_pick_from_tree(commit_info, new_parent)
+        return new_parent
+
+    async def make_virtual_diff_target(
+        self,
+        old_base: GitCommitHash,
+        old_head: GitCommitHash,
+        new_base: GitCommitHash,
+        new_head: GitCommitHash,
+        parent: GitCommitHash | None,
+    ) -> GitCommitHash:
+        """
+        Return a commit (optionally on top of parent) that provides a way to get the diff from old
+        head to new head while accounting for the fact that the base might have been rebased
+
+        We do this by "cherry-picking" the old branch with git merge-tree, but providing -X ours as
+        the strategy. This provides a tree that looks like the new base with old changes applied.
+        For cases where the old changes don't apply cleanly, the ours strategy prevents conflicts by
+        taking the version in the old tree. Although this can be a bit confusing when looking at the
+        file as a whole, it provides a succinct way to view a difference between the old version and
+        new version.
+
+        Note that providing -X ours does not actually ensure the merge succeeds without conflicts,
+        since there can still be add / remove conflicts, file / dir / symlink conflicts, and mode
+        conflicts among other more subtle ones. We currently handle this by ignoring them and
+        committing whatever git has decided to leave in the tree. Since this is purely informative,
+        deciding what to display in these corner cases can be tweaked as needed.
+        """
+        new_commit_info = CommitHeader(GitTreeHash(""), [parent] if parent else [])
+        new_commit_info.commit_msg = (
+            f"revup virtual diff target\n\n{old_base}\n{old_head}\n{new_base}\n{new_head}\n\n"
+            "revup uses this branch internally to generate browser viewable diffs. The commits and "
+            "diffs between commits are not meaningful or useful."
+        )
+
+        return await self.merge_tree_commit(
+            old_head, new_base, new_commit_info, old_base, "ours", ignore_conflicts=True
+        )
+
+    async def soft_reset(self, new_commit: GitCommitHash, env: dict) -> None:
+        await self.git("reset", "--soft", new_commit, env=env)
+
+        # TODO: only strictly needs to drop entries for HEAD
+        self.clear_cache()
+
+    async def credential(self, **kwargs: str) -> str:
+        cred = Credential(self, description=kwargs)
+        await cred.fill()
+        return cred.password
+
+
+class Credential:
+    git_ctx: Git
+    description: dict[str, str]
+
+    def __init__(self, git: Git, description: dict[str, str]):
+        self.git_ctx = git
+        self.description = description
+
+    def __getattr__(self, attr: str) -> Any:
+        return self.description[attr]
+
+    async def _run(self, subcommand: str, args: dict[str, str]) -> dict[str, str]:
+        input_str = "\n".join(f"{k}={v}" for k, v in args.items())
+        logging.debug(f"credential input:\n{input_str}")
+        stdout_str = await self.git_ctx.git_stdout(
+            "credential", subcommand, input_str=input_str, quiet=True
+        )
+        stdout_dict = {}
+        for line in stdout_str.splitlines():
+            if line == "":
+                break
+            k, v = line.split("=", 1)
+            stdout_dict[k] = v
+        return stdout_dict
+
+    async def fill(self) -> None:
+        self.description = await self._run("fill", self.description)
+
+    async def report(self, success: bool) -> None:
+        cmd = "approve" if success else "reject"
+        await self._run(cmd, self.description)
